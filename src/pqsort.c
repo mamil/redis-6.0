@@ -99,7 +99,7 @@ static void
 _pqsort(void *a, size_t n, size_t es,
     int (*cmp) (const void *, const void *), void *lrange, void *rrange)
 {
-	char *pa, *pb, *pc, *pd, *pl, *pm, *pn;
+	char *pa, *pb, *pc, *pd, *pl, *pm, *pn; // 别看项目写得大，命名也是没眼看
 	size_t d, r;
 	int swaptype, cmp_result;
 
