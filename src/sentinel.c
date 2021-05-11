@@ -3857,8 +3857,14 @@ void sentinelSimFailureCrash(void) {
 /* Vote for the sentinel with 'req_runid' or return the old vote if already
  * voted for the specified 'req_epoch' or one greater.
  *
+ * * 为运行 ID 为 req_runid 的 Sentinel 投上一票，有两种额外情况可能出现：
+ * 1) 如果 Sentinel 在 req_epoch 纪元已经投过票了，那么返回之前投的票。
+ * 2) 如果 Sentinel 已经为大于 req_epoch 的纪元投过票了，那么返回更大纪元的投票。
+ *
  * If a vote is not available returns NULL, otherwise return the Sentinel
- * runid and populate the leader_epoch with the epoch of the vote. */
+ * runid and populate the leader_epoch with the epoch of the vote.
+ * 如果投票暂时不可用，那么返回 NULL 。
+ * 否则返回 Sentinel 的运行 ID ，并将被投票的纪元保存到 leader_epoch 指针的值里面。*/
 char *sentinelVoteLeader(sentinelRedisInstance *master, uint64_t req_epoch, char *req_runid, uint64_t *leader_epoch) {
     if (req_epoch > sentinel.current_epoch) {
         sentinel.current_epoch = req_epoch;
@@ -3877,7 +3883,9 @@ char *sentinelVoteLeader(sentinelRedisInstance *master, uint64_t req_epoch, char
             master->leader, (unsigned long long) master->leader_epoch);
         /* If we did not voted for ourselves, set the master failover start
          * time to now, in order to force a delay before we can start a
-         * failover for the same master. */
+         * failover for the same master.
+         *
+         * 不投票给自己，把failover_start_time设置为现在，这样就不会为同一个master启动failover*/
         if (strcasecmp(master->leader,sentinel.myid))
             master->failover_start_time = mstime()+rand()%SENTINEL_MAX_DESYNC;
     }
@@ -3912,9 +3920,15 @@ int sentinelLeaderIncr(dict *counters, char *runid) {
 /* Scan all the Sentinels attached to this master to check if there
  * is a leader for the specified epoch.
  *
+ * 扫描所有监视 master 的 Sentinels ，查看是否有 Sentinels 是这个纪元的领头。
+ *
  * To be a leader for a given epoch, we should have the majority of
  * the Sentinels we know (ever seen since the last SENTINEL RESET) that
- * reported the same instance as leader for the same epoch. */
+ * reported the same instance as leader for the same epoch.
+ * * 要让一个 Sentinel 成为本纪元的领头，
+ * 这个 Sentinel 必须让大多数其他 Sentinel 承认它是该纪元的领头才行。*/
+
+// 选举出 master 在指定 epoch 上的领头
 char *sentinelGetLeader(sentinelRedisInstance *master, uint64_t epoch) {
     dict *counters;
     dictIterator *di;
@@ -3926,26 +3940,34 @@ char *sentinelGetLeader(sentinelRedisInstance *master, uint64_t epoch) {
     uint64_t max_votes = 0;
 
     serverAssert(master->flags & (SRI_O_DOWN|SRI_FAILOVER_IN_PROGRESS));
+    // 统计器
     counters = dictCreate(&leaderVotesDictType,NULL);
 
     voters = dictSize(master->sentinels)+1; /* All the other sentinels and me.*/
 
     /* Count other sentinels votes */
+    // 统计其他 sentinel 的主观 leader 投票
     di = dictGetIterator(master->sentinels);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
+        // 为目标 Sentinel 选出的领头 Sentinel 增加一票
         if (ri->leader != NULL && ri->leader_epoch == sentinel.current_epoch)
             sentinelLeaderIncr(counters,ri->leader);
     }
     dictReleaseIterator(di);
 
     /* Check what's the winner. For the winner to win, it needs two conditions:
+     * 选出领头 leader ，它必须满足以下两个条件：
      * 1) Absolute majority between voters (50% + 1).
-     * 2) And anyway at least master->quorum votes. */
+     *      有多于一半的 Sentinel 支持
+     * 2) And anyway at least master->quorum votes.
+     *      投票数至少要有 master->quorum 那么多 */
     di = dictGetIterator(counters);
     while((de = dictNext(di)) != NULL) {
+        // 取出票数
         uint64_t votes = dictGetUnsignedIntegerVal(de);
 
+        // 选出票数最大的人
         if (votes > max_votes) {
             max_votes = votes;
             winner = dictGetKey(de);
@@ -3956,24 +3978,35 @@ char *sentinelGetLeader(sentinelRedisInstance *master, uint64_t epoch) {
     /* Count this Sentinel vote:
      * if this Sentinel did not voted yet, either vote for the most
      * common voted sentinel, or for itself if no vote exists at all. */
+    // 本 Sentinel 进行投票
+    // 如果 Sentinel 之前还没有进行投票，那么有两种选择：
+    // 1）如果选出了 winner （最多票数支持的 Sentinel ），那么这个 Sentinel 也投 winner 一票
+    // 2）如果没有选出 winner ，那么 Sentinel 投自己一票
     if (winner)
         myvote = sentinelVoteLeader(master,epoch,winner,&leader_epoch);
     else
         myvote = sentinelVoteLeader(master,epoch,sentinel.myid,&leader_epoch);
 
+    // 领头 Sentinel 已选出，并且领头的纪元和给定的纪元一样
     if (myvote && leader_epoch == epoch) {
+        // 为领头 Sentinel 增加一票（这一票来自本 Sentinel ）
         uint64_t votes = sentinelLeaderIncr(counters,myvote);
 
+        // 如果投票之后的票数比最大票数要大，那么更换领头 Sentinel
         if (votes > max_votes) {
             max_votes = votes;
             winner = myvote;
         }
     }
 
+    // 如果支持领头的投票数量不超过半数
+    // 并且支持票数不超过 master 配置指定的投票数量
+    // 那么这次领头选举无效
     voters_quorum = voters/2+1;
     if (winner && (max_votes < voters_quorum || max_votes < master->quorum))
         winner = NULL;
 
+    // 返回领头 Sentinel ，或者 NULL
     winner = winner ? sdsnew(winner) : NULL;
     sdsfree(myvote);
     dictRelease(counters);
@@ -4233,29 +4266,39 @@ void sentinelFailoverWaitStart(sentinelRedisInstance *ri) {
     int isleader;
 
     /* Check if we are the leader for the failover epoch. */
+    // 获取给定纪元的领头 Sentinel
     leader = sentinelGetLeader(ri, ri->failover_epoch);
+    // 本 Sentinel 是否为领头 Sentinel
     isleader = leader && strcasecmp(leader,sentinel.myid) == 0;
     sdsfree(leader);
 
     /* If I'm not the leader, and it is not a forced failover via
-     * SENTINEL FAILOVER, then I can't continue with the failover. */
+     * SENTINEL FAILOVER, then I can't continue with the failover.
+
+    // 如果本 Sentinel 不是领头，并且这次故障迁移不是一次强制故障迁移操作
+    // 那么本 Sentinel 不做动作*/
     if (!isleader && !(ri->flags & SRI_FORCE_FAILOVER)) {
         int election_timeout = SENTINEL_ELECTION_TIMEOUT;
 
         /* The election timeout is the MIN between SENTINEL_ELECTION_TIMEOUT
-         * and the configured failover timeout. */
+         * and the configured failover timeout.
+         // 当选的时长（类似于任期）是 SENTINEL_ELECTION_TIMEOUT
+        // 和 Sentinel 设置的故障迁移时长之间的较小那个值*/
         if (election_timeout > ri->failover_timeout)
             election_timeout = ri->failover_timeout;
         /* Abort the failover if I'm not the leader after some time. */
+        // Sentinel 的当选时间已过，取消故障转移计划
         if (mstime() - ri->failover_start_time > election_timeout) {
             sentinelEvent(LL_WARNING,"-failover-abort-not-elected",ri,"%@");
             sentinelAbortFailover(ri);
         }
         return;
     }
+    // 本 Sentinel 作为领头，开始执行故障迁移操作...
     sentinelEvent(LL_WARNING,"+elected-leader",ri,"%@");
     if (sentinel.simfailure_flags & SENTINEL_SIMFAILURE_CRASH_AFTER_ELECTION)
         sentinelSimFailureCrash();
+    // 进入选择从服务器状态
     ri->failover_state = SENTINEL_FAILOVER_STATE_SELECT_SLAVE;
     ri->failover_state_change_time = mstime();
     sentinelEvent(LL_WARNING,"+failover-state-select-slave",ri,"%@");
@@ -4462,18 +4505,23 @@ void sentinelFailoverStateMachine(sentinelRedisInstance *ri) {
 
     switch(ri->failover_state) {
         case SENTINEL_FAILOVER_STATE_WAIT_START:
+            // 统计选票，查看是否成为leader
             sentinelFailoverWaitStart(ri);
             break;
         case SENTINEL_FAILOVER_STATE_SELECT_SLAVE:
+            // 从slave列表中选出最佳slave
             sentinelFailoverSelectSlave(ri);
             break;
         case SENTINEL_FAILOVER_STATE_SEND_SLAVEOF_NOONE:
+            // 把选出的slave设置为master
             sentinelFailoverSendSlaveOfNoOne(ri);
             break;
         case SENTINEL_FAILOVER_STATE_WAIT_PROMOTION:
+            // 等待升级生效，如果升级超时，那么重新选择新主服务器
             sentinelFailoverWaitPromotion(ri);
             break;
         case SENTINEL_FAILOVER_STATE_RECONF_SLAVES:
+            // 向从服务器发送 SLAVEOF 命令，让它们同步新主服务器
             sentinelFailoverReconfNextSlave(ri);
             break;
     }
