@@ -203,7 +203,7 @@ typedef struct sentinelRedisInstance {
     /* Master specific. */
     dict *sentinels;    /* Other sentinels monitoring the same master. */
     dict *slaves;       /* Slaves for this master instance. */
-    unsigned int quorum;/* Number of sentinels that need to agree on failure. */
+    unsigned int quorum;/* Number of sentinels that need to agree on failure. 可以配置超过多少票可以当选master */
     int parallel_syncs; /* How many slaves to reconfigure at same time. */
     char *auth_pass;    /* Password to use for AUTH against master & replica. */
     char *auth_user;    /* Username for ACLs AUTH against master & replica. */
@@ -3792,14 +3792,18 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
     dictIterator *di;
     dictEntry *de;
 
+    // 遍历正在监视相同 master 的所有 sentinel
+    // 向它们发送 SENTINEL is-master-down-by-addr 命令
     di = dictGetIterator(master->sentinels);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
+        // 距离该 sentinel 最后一次回复 SENTINEL master-down-by-addr 命令已经过了多久
         mstime_t elapsed = mstime() - ri->last_master_down_reply_time;
         char port[32];
         int retval;
 
         /* If the master state from other sentinel is too old, we clear it. */
+        // 如果目标 Sentinel 关于主服务器的信息已经太久没更新，那么我们清除它
         if (elapsed > SENTINEL_ASK_PERIOD*5) {
             ri->flags &= ~SRI_MASTER_DOWN;
             sdsfree(ri->leader);
@@ -3807,10 +3811,15 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
         }
 
         /* Only ask if master is down to other sentinels if:
+         *只在以下情况满足时，才向其他 sentinel 询问主服务器是否已下线
          *
          * 1) We believe it is down, or there is a failover in progress.
+         *    本 sentinel 相信服务器已经下线，或者针对该主服务器的故障转移操作正在执行
          * 2) Sentinel is connected.
-         * 3) We did not receive the info within SENTINEL_ASK_PERIOD ms. */
+         *    目标 Sentinel 与本 Sentinel 已连接
+         * 3) We did not receive the info within SENTINEL_ASK_PERIOD ms.
+         *    当前 Sentinel 在 SENTINEL_ASK_PERIOD 毫秒内没有获得过目标 Sentinel 发来的信息
+         * 4) 条件 1 和条件 2 满足而条件 3 不满足，但是 flags 参数给定了 SENTINEL_ASK_FORCED 标识*/
         if ((master->flags & SRI_S_DOWN) == 0) continue;
         if (ri->link->disconnected) continue;
         if (!(flags & SENTINEL_ASK_FORCED) &&
@@ -3818,6 +3827,7 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
             continue;
 
         /* Ask */
+        // 发送 SENTINEL is-master-down-by-addr 命令
         ll2string(port,sizeof(port),master->addr->port);
         retval = redisAsyncCommand(ri->link->cc,
                     sentinelReceiveIsMasterDownReply, ri,
@@ -3825,6 +3835,9 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
                     sentinelInstanceMapCommand(ri,"SENTINEL"),
                     master->addr->ip, port,
                     sentinel.current_epoch,
+                    // 如果本 Sentinel 已经检测到 master 进入 ODOWN
+                    // 并且要开始一次故障转移，那么向其他 Sentinel 发送自己的运行 ID
+                    // 让对方将给自己投一票（如果对方在这个纪元内还没有投票的话）
                     (master->failover_state > SENTINEL_FAILOVER_STATE_NONE) ?
                     sentinel.myid : "*");
         if (retval == C_OK) ri->link->pending_commands++;
@@ -4043,30 +4056,43 @@ int sentinelSendSlaveOf(sentinelRedisInstance *ri, char *host, int port) {
 }
 
 /* Setup the master state to start a failover. */
+// 设置主服务器的状态，开始一次故障转移
 void sentinelStartFailover(sentinelRedisInstance *master) {
     serverAssert(master->flags & SRI_MASTER);
 
+    // 更新故障转移状态
     master->failover_state = SENTINEL_FAILOVER_STATE_WAIT_START;
+    // 更新主服务器状态
     master->flags |= SRI_FAILOVER_IN_PROGRESS;
+    // 更新epoch
     master->failover_epoch = ++sentinel.current_epoch;
     sentinelEvent(LL_WARNING,"+new-epoch",master,"%llu",
         (unsigned long long) sentinel.current_epoch);
     sentinelEvent(LL_WARNING,"+try-failover",master,"%@");
+    // 记录故障转移状态的变更时间
     master->failover_start_time = mstime()+rand()%SENTINEL_MAX_DESYNC;
     master->failover_state_change_time = mstime();
 }
 
 /* This function checks if there are the conditions to start the failover,
  * that is:
+ * 这个函数检查是否需要开始一次故障转移操作：
  *
  * 1) Master must be in ODOWN condition.
+ *    主服务器已经计入 ODOWN 状态。
  * 2) No failover already in progress.
+ *    当前没有针对同一主服务器的故障转移操作在执行。
  * 3) No failover already attempted recently.
+ *    最近时间内，这个主服务器没有尝试过执行故障转移
+ *    （应该是为了防止频繁执行）
  *
  * We still don't know if we'll win the election so it is possible that we
  * start the failover but that we'll not be able to act.
+ * 虽然 Sentinel 可以发起一次故障转移，但因为故障转移操作是由领头 Sentinel 执行的，
+ * 所以发起故障转移的 Sentinel 不一定就是执行故障转移的 Sentinel 。
  *
- * Return non-zero if a failover was started. */
+ * Return non-zero if a failover was started.
+ * 如果故障转移操作成功开始，那么函数返回非 0 值。 */
 int sentinelStartFailoverIfNeeded(sentinelRedisInstance *master) {
     /* We can't failover if the master is not in O_DOWN state. */
     if (!(master->flags & SRI_O_DOWN)) return 0;
