@@ -3094,12 +3094,25 @@ void clusterFailoverReplaceYourMaster(void) {
  * 2) Try to get elected by masters.
  * 3) Perform the failover informing all the other nodes.
  */
-void clusterHandleSlaveFailover(void) {
+/*
+从节点的故障转移，是在函数clusterHandleSlaveFailover中处理的，该函数在集群定时器函数 clusterCron 中调用。本函数
+用于处理从节点进行故障转移的整个流程，包括：判断是否可以发起选举；判断选举是否超时；判断自己是否拉
+到了足够的选票；使自己升级为新的主节点这些所有流程。
+*/
+//slave调用
+void clusterHandleSlaveFailover(void) { //clusterBeforeSleep对CLUSTER_TODO_HANDLE_FAILOVER状态的处理,或者clusterCron中实时处理
+    //也就是当前从节点与主节点已经断链了多长时间,从通过ping pong超时，检测到本slave的master掉线了，从这时候开始算
     mstime_t data_age;
+    //该变量表示距离发起故障转移流程，已经过去了多少时间；
     mstime_t auth_age = mstime() - server.cluster->failover_auth_time;
+    //该变量表示当前从节点必须至少获得多少选票，才能成为新的主节点
     int needed_quorum = (server.cluster->size / 2) + 1;
+    //表示是否是管理员手动触发的故障转移流程；
     int manual_failover = server.cluster->mf_end != 0 &&
-                          server.cluster->mf_can_start;
+                          server.cluster->mf_can_start; //说明向从发送了cluster failover force要求该从进行强制故障转移
+    // auth_timeout:该变量表示故障转移流程(发起投票，等待回应)的超时时间，超过该时间后还没有获得足够的选票，则表示本次故障转移失败；
+    // auth_retry_time:该变量表示判断是否可以开始下一次故障转移流程的时间，只有距离上一次发起故障转移时，已经超过auth_retry_time之后，
+    //才表示可以开始下一次故障转移了（auth_age > auth_retry_time）；
     mstime_t auth_timeout, auth_retry_time;
 
     server.cluster->todo_before_sleep &= ~CLUSTER_TODO_HANDLE_FAILOVER;
@@ -3122,6 +3135,10 @@ void clusterHandleSlaveFailover(void) {
      * 3) We don't have the no failover configuration set, and this is
      *    not a manual failover.
      * 4) It is serving slots. */
+    /*
+    当前节点是主节点；当前节点是从节点但是没有主节点；当前节点的主节点不处于下线状态并且不是手动强制进行故障转移；
+    当前节点的主节点没有负责的槽位。满足以上任一条件，则不能进行故障转移，直接返回即可；
+    */
     if (nodeIsMaster(myself) ||
         myself->slaveof == NULL ||
         (!nodeFailed(myself->slaveof) && !manual_failover) ||
